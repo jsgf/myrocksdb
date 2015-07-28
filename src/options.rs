@@ -1,26 +1,285 @@
-use std::ffi::CString;
-use std::ptr;
-use libc::{c_uchar, c_int, c_uint, c_double, uint64_t, uint32_t, size_t};
+use std::ffi::{CString, CStr};
+use std::cmp::Ordering;
+use std::mem;
+use std::slice;
+use std::path::Path;
+use std::marker::PhantomData;
+use std::convert::From;
 
+use libc::{c_uchar, c_char, c_int, c_uint, c_double, c_void, uint64_t, uint32_t, size_t};
+
+use super::{Db,Result};
 use super::ffi;
+
+/// Options for constructing or accessing a RocksDB instance.
+///
+/// `Options` follows the builder pattern, whereby one can either construct and open a db in a
+/// single line, or for more complex cases, build up options with arbitrarily complex logic before
+/// opening the db.
+///
+/// For example, a simple one-liner:
+///
+/// ```no_run
+/// # use myrocksdb::Options;
+/// # use std::path::Path;
+/// let db = Options::new()
+///             .error_if_exists(true)
+///             .open(Path::new("foo"));
+/// ```
+///
+/// Or alternatively: over multiple lines:
+///
+/// ```no_run
+/// # use myrocksdb::{Options,Compression};
+/// # use myrocksdb::Db;
+/// # use std::path::Path;
+/// let mut opts = Options::new();
+/// opts.error_if_exists(true);
+/// opts.compression(Compression::LZ4);
+/// let db = Db::open(&opts, Path::new("foo"));
+/// ```
 
 pub struct Options {
     options: *mut ffi::rocksdb_options_t,
 }
 
-// TBD
-pub struct CompactionFilter {
+impl Drop for Options {
+    fn drop(&mut self) {
+        unsafe { ffi::rocksdb_options_destroy(self.options) }
+    }
+}
+
+pub struct CompactionFilter<'a, F>
+    where F: Filter<'a>
+{
     filter: *mut ffi::rocksdb_compactionfilter_t,
+    ty: PhantomData<(F,&'a ())>
 }
 
-// TBD
-pub struct CompactionFilterFactory {
-    filterfactory: *mut ffi::rocksdb_compactionfilterfactory_t,
+/// Create a compaction filter. A single filter created this way may be called from multiple
+/// threads, and must therefore be thread safe.
+impl<'a, F> CompactionFilter<'a, F>
+    where F: Filter<'a>
+{
+    pub fn new(filt: F) -> CompactionFilter<'a, F>
+        where F: Sync + Send
+    {
+        Self::make(filt)
+    }
+
+    fn make(filt: F) -> CompactionFilter<'a, F> {
+        CompactionFilter {
+            filter: unsafe {
+                ffi::rocksdb_compactionfilter_create(Box::into_raw(Box::new(filt)) as *mut c_void,
+                                                     Some(compaction_drop_cb::<F>),
+                                                     Some(compaction_filter_cb::<F>),
+                                                     Some(compaction_name_cb::<F>))
+            },
+            ty: PhantomData
+        }
+    }
+
+    /// Consume self and return the raw pointer
+    fn into_ptr(self) -> *mut ffi::rocksdb_compactionfilter_t {
+        let ret = self.filter;
+        mem::forget(self);            
+        ret
+    }
 }
 
-// TBD
-pub struct Comparator {
-    comparator: *mut ffi::rocksdb_comparator_t,
+impl<'a, F> Drop for CompactionFilter<'a, F>
+    where F: Filter<'a>
+{
+    fn drop(&mut self) {
+        unsafe { ffi::rocksdb_compactionfilter_destroy(self.filter); }
+    }
+}
+
+pub enum FilterRes<V: AsRef<[u8]>> {
+    Remove,
+    Preserve,
+    Change(V),
+}
+
+pub trait Filter<'a> {
+    type Key: From<&'a [u8]>;
+    type Val: From<&'a [u8]> + AsRef<[u8]>;
+
+    /// Return the name of the filter
+    fn name(&self) -> &CStr;
+
+    /// The actual filter itself
+    fn filter(&self, level: u32, key: &Self::Key, val: &Self::Val) -> FilterRes<Self::Val>;
+
+    /// Stash the value in a per-thread storage which will be live until the next call to the filter
+    /// function. Hacky consequence of the C compaction filter binding.
+    fn stash(&self, val: Self::Val) -> &Self::Val;
+}
+
+extern fn compaction_filter_cb<'a, F>(ptr: *mut c_void, level: c_int,
+                                      key: *const c_char, keylen: size_t,
+                                      existing: *const c_char, vallen: size_t,
+                                      newval: *mut *mut c_char, newlen: *mut size_t,
+                                      val_changed: *mut c_uchar) -> c_uchar
+    where F: Filter<'a>
+{
+    let ptr = ptr as *const Box<F>;
+
+    unsafe {
+        let ptr = &*ptr;
+        let key = F::Key::from(slice::from_raw_parts(key as *const u8, keylen as usize));
+        let val = F::Val::from(slice::from_raw_parts(existing as *const u8, vallen as usize));
+
+        match ptr.filter(level as u32, &key, &val) {
+            FilterRes::Remove => 1,
+            FilterRes::Preserve => {
+                *val_changed = 0;
+                0
+            },
+            FilterRes::Change(v) => {
+                let v = ptr.stash(v); // keep v alive till next call
+                let s = v.as_ref();
+                let p = s.as_ptr();
+                let l = s.len();
+                
+                *val_changed = 1;
+                *newval = p as *mut c_char;
+                *newlen = l as size_t;
+                0
+            },
+        }
+    }
+}
+
+extern fn compaction_drop_cb<'a, F>(ptr: *mut c_void)
+    where F: Filter<'a>
+{
+    let ptr = ptr as *mut F;
+    unsafe {
+        let _ = Box::from_raw(ptr); // drops
+    }
+}
+
+extern fn compaction_name_cb<'a, F>(ptr: *mut c_void) -> *const c_char
+    where F: Filter<'a>
+{
+    let ptr = ptr as *const Box<F>;
+
+    let s = unsafe { (&*ptr).name() };
+    s.as_ptr()
+}
+
+extern fn compactionfilterfactory_drop_cb<'a, FF, F>(ptr: *mut c_void)
+    where FF: FilterFactory<'a, F>, F: Filter<'a>
+{
+    let ptr = ptr as *mut F;
+    unsafe {
+        let _ = Box::from_raw(ptr); // drops
+    }    
+}
+
+extern fn compactionfilterfactory_name_cb<'a, FF, F>(ptr: *mut c_void) -> *const c_char
+    where FF: FilterFactory<'a, F>, F: Filter<'a>
+{
+    let ptr = ptr as *const Box<FF>;
+
+    let s = unsafe { (&*ptr).name() };
+    s.as_ptr()
+}
+
+extern fn compactionfilterfactory_createfilter_cb<'a, FF, F>(ptr: *mut c_void, context: *mut ffi::rocksdb_compactionfiltercontext_t) -> *mut ffi::rocksdb_compactionfilter_t
+    where FF: FilterFactory<'a, F>, F: Filter<'a>
+{
+    let ptr = ptr as *mut FF;
+    let ptr = unsafe { &mut *ptr };
+    let cctx = CompactionFilterContext(&context);
+
+    let filt = ptr.createfilter(&cctx);
+
+    CompactionFilter::make(filt).into_ptr()
+}
+
+pub struct CompactionFilterContext<'a>(&'a *mut ffi::rocksdb_compactionfiltercontext_t);
+
+impl<'a> CompactionFilterContext<'a> {
+    pub fn is_full_compaction(&self) -> bool {
+        unsafe { ffi::rocksdb_compactionfiltercontext_is_full_compaction(*self.0) != 0 }
+    }
+
+    pub fn is_manual_compaction(&self) -> bool {
+        unsafe { ffi::rocksdb_compactionfiltercontext_is_manual_compaction(*self.0) != 0 }
+    }
+}
+
+/// A factory for compaction `Filter`s.
+pub trait FilterFactory<'a, F>
+    where F: Filter<'a>
+{
+    fn createfilter(&mut self, ctx: &CompactionFilterContext) -> F;
+    fn name(&self) -> &CStr;    
+}
+
+pub trait Comparator<'a> {
+    type Key: From<&'a [u8]>;
+    
+    fn name(&self) -> &CStr;
+    fn compare(&self, a: &Self::Key, b: &Self::Key) -> Ordering;
+}
+
+extern fn comparator_drop_cb<'a, C>(ptr: *mut c_void)
+    where C: Comparator<'a>
+{
+    let ptr = ptr as *mut C;
+    unsafe {
+        let _ = Box::from_raw(ptr); // drops
+    }
+}
+
+extern fn comparator_name_cb<'a, C>(ptr: *mut c_void) -> *const c_char
+    where C: Comparator<'a>
+{
+    let ptr = ptr as *const Box<C>;
+
+    let s = unsafe { (&*ptr).name() };
+    s.as_ptr()
+}
+
+extern fn comparator_compare_cb<'a, C>(ptr: *mut c_void,
+                                       aptr: *const c_char, alen: size_t,
+                                       bptr: *const c_char, blen: size_t) -> c_int
+    where C: Comparator<'a>
+{
+    let ptr = ptr as *const Box<C>;
+
+    unsafe {
+        let ptr = &*ptr;
+        let a = C::Key::from(slice::from_raw_parts(aptr as *const u8, alen as usize));
+        let b = C::Key::from(slice::from_raw_parts(bptr as *const u8, blen as usize));
+
+        match ptr.compare(&a, &b) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        }
+    }
+}
+
+pub struct DefaultCompare<'a, K>(CString, PhantomData<(&'a K)>)
+    where K: From<&'a [u8]> + Ord + 'a;
+
+impl<'a, T> DefaultCompare<'a, T>
+    where T: From<&'a [u8]> + Ord + 'a
+{
+    pub fn new() -> DefaultCompare<'a, T> { DefaultCompare(CString::new("default").unwrap(), PhantomData) }
+}
+
+impl<'a, T> Comparator<'a> for DefaultCompare<'a, T>
+    where T: From<&'a [u8]> + Ord + 'a
+{
+    type Key = T;
+
+    fn name<'b>(&'b self) -> &'b CStr { &self.0 }
+    fn compare(&self, a: &T, b: &T) -> Ordering { a.cmp(b) }
 }
 
 // TBD
@@ -28,9 +287,21 @@ pub struct MergeOperator {
     mergeoperator: *mut ffi::rocksdb_mergeoperator_t,
 }
 
+impl Drop for MergeOperator {
+    fn drop(&mut self) {
+        unsafe { ffi::rocksdb_mergeoperator_destroy(self.mergeoperator); }        
+    }
+}
+
 // TBD
 pub struct SliceTransform {
     slicetransform: *mut ffi::rocksdb_slicetransform_t,
+}
+
+impl Drop for SliceTransform {
+    fn drop(&mut self) {
+        unsafe { ffi::rocksdb_slicetransform_destroy(self.slicetransform); }
+    }
 }
 
 #[repr(u32)]
@@ -67,35 +338,78 @@ pub enum Compression {
 }
 
 #[repr(u32)]
+/// The index type that will be used for this table.
 pub enum IndexType {
+    /// A space efficient index block that is optimized for
+    /// binary-search-based index.
     BinarySearch = ffi::rocksdb_block_based_table_index_type_binary_search,
+    /// The hash index, if enabled, will do the hash lookup when
+    /// `Options.prefix_extractor` is provided.
     HashSearch = ffi::rocksdb_block_based_table_index_type_hash_search,
 }
 
 impl Options {
+    /// Construct a new default set of options
     pub fn new() -> Options {
         Options {
             options: unsafe { ffi::rocksdb_options_create() }
         }
     }
 
+    /// Create a new `Db` instance with the current set of options
+    pub fn open<P: AsRef<Path>>(&self, name: P) -> Result<Db> { Db::open(self, name) }
+
+    /// Create a new read-only `Db` instance with the current set of options
+    pub fn open_for_read_only<P: AsRef<Path>>(&self, name: P, error_if_log_exists: bool) -> Result<Db> {
+        Db::open_for_read_only(self, name, error_if_log_exists)
+    }
+
+    /// Set the "create if missing flag". The Db will be created if missing.
     pub fn create_if_missing(&mut self, create: bool) -> &mut Options {
         unsafe { ffi::rocksdb_options_set_create_if_missing(self.options, create as c_uchar) };
         self
     }
 
+    /// Set the "error if exists" flag. The open will fail if the db already exists.
     pub fn error_if_exists(&mut self, excl: bool) -> &mut Options {
         unsafe { ffi::rocksdb_options_set_error_if_exists(self.options, excl as c_uchar) };
         self
     }
 
+    /// Increase the parallelism by setting the number of threads.
+    ///
+    /// By default, RocksDB uses only one background thread for flush and
+    /// compaction. Calling this function will set it up such that total of
+    /// `total_threads` is used. Good value for `total_threads` is the number of
+    /// cores. You almost definitely want to call this function if your system is
+    /// bottlenecked by RocksDB.
     pub fn increase_parallelism(&mut self, total_threads: u32) -> &mut Options {
         unsafe { ffi::rocksdb_options_increase_parallelism(self.options, total_threads as c_int) };
         self
     }
-
+    
+    /// Use this if you don't need to keep the data sorted, i.e. you'll never use
+    /// an iterator, only Put() and Get() API calls
     pub fn optimize_for_point_lookup(&mut self, block_cache_size_mb: u64) -> &mut Options {
         unsafe { ffi::rocksdb_options_optimize_for_point_lookup(self.options, block_cache_size_mb) };
+        self
+    }
+
+    /// Default values for some parameters in ColumnFamilyOptions are not optimized for heavy
+    /// workloads and big datasets, which means you might observe write stalls under some
+    /// conditions. As a starting point for tuning RocksDB options, use the following two functions:
+    ///
+    /// * OptimizeLevelStyleCompaction -- optimizes level style compaction
+    /// * OptimizeUniversalStyleCompaction -- optimizes universal style compaction
+    ///
+    /// Universal style compaction is focused on reducing Write Amplification Factor for big data
+    /// sets, but increases Space Amplification. You can learn more about the different styles
+    /// [here](https:///github.com/facebook/rocksdb/wiki/Rocksdb-Architecture-Guide). Make sure to
+    /// also call `increase_parallelism()`, which will provide the biggest performance gains.
+    ///
+    /// Note: we might use more memory than memtable_memory_budget during high write rate period
+    pub fn compaction_style(&mut self, compactionstyle: CompactionStyle) -> &mut Options {
+        unsafe { ffi::rocksdb_options_set_compaction_style(self.options, compactionstyle as c_int) }
         self
     }
 
@@ -109,18 +423,76 @@ impl Options {
         self
     }
 
-    pub fn compaction_filter(&mut self, filter: CompactionFilter) -> &mut Options {
-        unsafe { ffi::rocksdb_options_set_compaction_filter(self.options, filter.filter) };
+    /// A single CompactionFilter instance to call into during compaction.  Allows an application to
+    /// modify/delete a key-value during background compaction.
+    ///
+    /// If the client requires a new compaction filter to be used for different compaction runs, it
+    /// can specify `compaction_filter_factory` instead of this option.  The client should specify
+    /// only one of the two.  compaction_filter takes precedence over compaction_filter_factory if
+    /// client specifies both.
+    ///
+    /// If multithreaded compaction is being used, the supplied `Filter` instance may be
+    /// used from different threads concurrently and so should be thread-safe.
+    pub fn compaction_filter<'a, F>(&mut self, filter: F) -> &mut Options
+        where F: Filter<'a>
+    {
+        unsafe {
+            let cf =
+                ffi::rocksdb_compactionfilter_create(Box::into_raw(Box::new(filter)) as *mut c_void,
+                                                     Some(compaction_drop_cb::<F>),
+                                                     Some(compaction_filter_cb::<F>),
+                                                     Some(compaction_name_cb::<F>));
+            // Takes ownership
+            ffi::rocksdb_options_set_compaction_filter(self.options, cf);
+        };
         self
     }
 
-    pub fn compaction_filter_factory(&mut self, filter: CompactionFilterFactory) -> &mut Options {
-        unsafe { ffi::rocksdb_options_set_compaction_filter_factory(self.options, filter.filterfactory) };
+    /// This is a factory that provides compaction filter objects which allow an application to
+    /// modify/delete a key-value during background compaction.
+    ///
+    /// A new filter will be created on each compaction run.  If multithreaded compaction is being
+    /// used, each created CompactionFilter will only be used from a single thread and so does not
+    /// need to be thread-safe.
+    ///
+    /// (TBD: At present `Filter` must always present a thread-safe interface. In future a MutFilter
+    /// interface will exist to allow direct mutation in a single-threaded context.)
+    pub fn compaction_filter_factory<'a, FF, F>(&mut self, factory: FF) -> &mut Options
+        where FF: FilterFactory<'a, F>, F: Filter<'a>
+    {
+        unsafe {
+            let ff =
+                ffi::rocksdb_compactionfilterfactory_create(Box::into_raw(Box::new(factory)) as *mut c_void,
+                                                            Some(compactionfilterfactory_drop_cb::<FF, F>),
+                                                            Some(compactionfilterfactory_createfilter_cb::<FF, F>),
+                                                            Some(compactionfilterfactory_name_cb::<FF, F>));
+            // shared ptr
+            ffi::rocksdb_options_set_compaction_filter_factory(self.options, ff);
+
+            // Release local reference
+            ffi::rocksdb_compactionfilterfactory_destroy(ff);
+        };
         self
     }
 
-    pub fn comparator(&mut self, cmp: Comparator) -> &mut Options {
-        unsafe { ffi::rocksdb_options_set_comparator(self.options, cmp.comparator) };
+    /// Comparator used to define the order of keys in the table.  Default: a comparator that uses
+    /// lexicographic byte-wise ordering
+    ///
+    /// REQUIRES: The client must ensure that the comparator supplied here has the same name and
+    /// orders keys *exactly* the same as the comparator provided to previous open calls on the same
+    /// DB.
+    pub fn comparator<'a, C>(&mut self, cmp: C) -> &mut Options
+        where C: Comparator<'a>
+    {
+        unsafe {
+            let cmp = ffi::rocksdb_comparator_create(Box::into_raw(Box::new(cmp)) as *mut c_void,
+                                                     Some(comparator_drop_cb::<C>),
+                                                     Some(comparator_compare_cb::<C>),
+                                                     Some(comparator_name_cb::<C>));
+
+            // takes ownership
+            ffi::rocksdb_options_set_comparator(self.options, cmp);
+        };
         self
     }
 
@@ -304,17 +676,15 @@ impl Options {
         self
     }
 
-    // XXX use Path?
-    pub fn db_log_dir(&mut self, dir: &str) -> &mut Options {
-        if let Ok(cdir) = CString::new(dir) {
+    pub fn db_log_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Options {
+        if let Some(cdir) = dir.as_ref().as_os_str().to_cstring() {
             unsafe { ffi::rocksdb_options_set_db_log_dir(self.options, cdir.as_ptr()) }
         };
         self
     }
 
-    // XXX use Path?
-    pub fn wal_dir(&mut self, dir: &str) -> &mut Options {
-        if let Ok(cdir) = CString::new(dir) {
+    pub fn wal_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Options {
+        if let Some(cdir) = dir.as_ref().as_os_str().to_cstring() {
             unsafe { ffi::rocksdb_options_set_wal_dir(self.options, cdir.as_ptr()) }
         };
         self
@@ -468,7 +838,7 @@ impl Options {
     }
 
     pub fn memtable_prefix_bloom_probes(&mut self, probes: u32) -> &mut Options {
-        unsafe { ffi::rocksdb_options_set_memtable_prefix_bloom_bits(self.options, probes as uint32_t) }
+        unsafe { ffi::rocksdb_options_set_memtable_prefix_bloom_probes(self.options, probes as uint32_t) }
         self
     }
 
@@ -502,11 +872,6 @@ impl Options {
         self
     }
 
-    pub fn compaction_style(&mut self, compactionstyle: CompactionStyle) -> &mut Options {
-        unsafe { ffi::rocksdb_options_set_compaction_style(self.options, compactionstyle as c_int) }
-        self
-    }
-
     pub fn universal_compaction_options(&mut self, options: &UniversalCompactionOptions) -> &mut Options {
         unsafe { ffi::rocksdb_options_set_universal_compaction_options(self.options, options.options) }
         self
@@ -518,18 +883,12 @@ impl Options {
     }
 }
 
-impl Drop for Options {
-    fn drop(&mut self) {
-        unsafe { ffi::rocksdb_options_destroy(self.options) }
-    }
-}
-
 // Function public to modules within the crate, not exported
 pub fn get_options_ptr(opts: &Options) -> *mut ffi::rocksdb_options_t {
     opts.options
 }
 
-pub struct FilterPolicy {
+struct FilterPolicy {
     filter: *mut ffi::rocksdb_filterpolicy_t,
 }
 
@@ -543,10 +902,7 @@ impl FilterPolicy {
 
 impl Drop for FilterPolicy {
     fn drop(&mut self) {
-        if !self.filter.is_null() {
-            unsafe { ffi::rocksdb_filterpolicy_destroy(self.filter) };
-            self.filter = ptr::null_mut();
-        }
+        unsafe { ffi::rocksdb_filterpolicy_destroy(self.filter) };
     }
 }
 
@@ -555,6 +911,7 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// Construct an LRU cache with `capacity` bytes.
     pub fn lru(capacity: usize) -> Cache {
         Cache {
             cache: unsafe { ffi::rocksdb_cache_create_lru(capacity as size_t) }
@@ -564,10 +921,7 @@ impl Cache {
 
 impl Drop for Cache {
     fn drop(&mut self) {
-        if !self.cache.is_null() {
-            unsafe { ffi::rocksdb_cache_destroy(self.cache) }
-            self.cache = ptr::null_mut();
-        }
+        unsafe { ffi::rocksdb_cache_destroy(self.cache) }
     }
 }
 
@@ -599,57 +953,123 @@ pub enum ChecksumType {
     xxHash = 2,
 }
 
+/// Configuration options for block-based tables.
+///
+/// Example:
+///
+/// ```no_run
+/// # use myrocksdb::{Options,BlockBasedTableOptions};
+/// # use std::path::Path;
+/// let mut opts = Options::new();
+///
+/// BlockBasedTableOptions::new()
+///               .block_size(4096)
+///               .bloom_filter(12)
+///               .set(&mut opts);
+///
+/// let db = opts.open(Path::new("foo"));
+/// # let _ = db;
 pub struct BlockBasedTableOptions {
     options: *mut ffi::rocksdb_block_based_table_options_t,
 }
 
 impl BlockBasedTableOptions {
+    /// Construct a new default set of table options.
     pub fn new() -> BlockBasedTableOptions {
         BlockBasedTableOptions {
             options: unsafe { ffi::rocksdb_block_based_options_create() }
         }
     }
 
+    /// Initialize a block-based table factory in `Options`.
+    pub fn set<'a>(&self, opts: &'a mut Options) -> &'a mut Options {
+        opts.block_based_table_factory(self);
+        opts
+    }
+    
+    /// Approximate size of user data packed per block.
+    ///
+    /// Note that the block size specified here corresponds to uncompressed data.  The actual size
+    /// of the unit read from disk may be smaller if compression is enabled.  This parameter can be
+    /// changed dynamically.
     pub fn block_size(&mut self, sz: u64) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_block_size(self.options, sz as size_t) }
         self
     }
 
+    // This is used to close a block before it reaches the configured `block_size`. If the
+    // percentage of free space in the current block is less than this specified number and adding a
+    // new record to the block will exceed the configured block size, then this block will be closed
+    // and the new record will be written to the next block.
     pub fn block_size_deviation(&mut self, sz: u32) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_block_size_deviation(self.options, sz as c_int) }
         self
     }
 
+    /// Number of keys between restart points for delta encoding of keys.  This parameter can be
+    /// changed dynamically.  Most clients should leave this parameter alone.
     pub fn block_restart_interval(&mut self, interval: u32) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_block_restart_interval(self.options, interval as c_int) }
         self
     }
 
-    pub fn filter_policy(&mut self, filter: FilterPolicy) -> &mut BlockBasedTableOptions {
+    /// Set a new filter policy that uses a bloom filter with approximately the specified number of
+    /// bits per key.
+    ///
+    /// `bits_per_key`: bits per key in bloom filter. A good value for bits_per_key is 10, which
+    /// yields a filter with ~1% false positive rate.  use_block_based_builder: use block based
+    /// filter rather than full fiter.  If you want to builder full filter, it needs to be set to
+    /// false.
+    ///
+    // XXX work out lifetime issues
+    // Callers must delete the result after any database that is using the result has been closed.
+    //
+    // Note (TBD): if you are using a custom comparator that ignores some parts of the keys being
+    // compared, you must not use `bloom_filter()` and must provide your own `FilterPolicy` that
+    // also ignores the corresponding parts of the keys.  For example, if the comparator ignores
+    // trailing spaces, it would be incorrect to use a FilterPolicy (like NewBloomFilterPolicy)
+    // that does not ignore trailing spaces in keys.
+    pub fn bloom_filter(&mut self, bits_per_key: u32) -> &mut BlockBasedTableOptions {
+        let filter = FilterPolicy::bloom(bits_per_key);
+        self.filter_policy(filter);
+        self
+    }
+
+    fn filter_policy(&mut self, filter: FilterPolicy) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_filter_policy(self.options, filter.filter) };
         self
     }
 
+    /// Disable block cache. If this is set to true, then no block cache should be used.
     pub fn no_block_cache(&mut self, nocache: bool) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_no_block_cache(self.options, nocache as c_uchar) }
         self
     }
 
+    /// Use the specified cache for blocks. If not set, rocksdb will automatically create and use
+    /// an 8MB internal cache.
     pub fn block_cache(&mut self, cache: &Cache) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_block_cache(self.options, cache.cache) }
         self
     }
 
+    /// Use the specified cache for compressed blocks. If not set, rocksdb will not use a
+    /// compressed block cache.
     pub fn block_cache_compressed(&mut self, cache: &Cache) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_block_cache_compressed(self.options, cache.cache) }
         self
     }
 
+    /// If true (the detault), place whole keys in the filter (not just prefixes).
+    /// This must generally be true for gets to be efficient.
     pub fn whole_key_filtering(&mut self, yes: bool) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_whole_key_filtering(self.options, yes as c_uchar) }
         self
     }
 
+    /// Version used for new tables.
+    /// This option only affects newly written tables. When reading exising tables,
+    /// the information about version is read from the footer.
     pub fn format_version(&mut self, version: TableVersion) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_format_version(self.options, version as c_int) }
         self
@@ -659,7 +1079,10 @@ impl BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_index_type(self.options, idx as c_int) }
         self
     }
-
+    
+    /// Influence the behavior when kHashSearch is used.  If false, stores a precise prefix to block
+    /// range mapping if true, does not store prefix and allows prefix hash collision (less memory
+    /// consumption).
     pub fn hash_index_allow_collision(&mut self, yes: bool) -> &mut BlockBasedTableOptions {
         unsafe { ffi::rocksdb_block_based_options_set_hash_index_allow_collision(self.options, yes as c_uchar) }
         self
@@ -674,5 +1097,70 @@ impl BlockBasedTableOptions {
 impl Drop for BlockBasedTableOptions {
     fn drop(&mut self) {
         unsafe { ffi::rocksdb_block_based_options_destroy(self.options) }
+    }
+}
+
+#[allow(unused_imports)]
+#[cfg(test)]
+mod test {
+    use super::{Options, DefaultCompare, CompactionFilter, Filter, FilterRes};
+    use std::ffi::{CString, CStr};
+    use std::str;
+    use std::ops::Deref;
+    use std::cmp::{Ord,Ordering};
+
+    struct Wrap<T>(T);
+    impl<T> Wrap<T> {
+        fn wrap(v: T) -> Wrap<T> { Wrap(v) }
+        //fn unwrap(self) -> T { self.0 }
+    }
+    impl<T> From<T> for Wrap<T> {
+        fn from(v: T) -> Wrap<T> { Wrap::wrap(v) }
+    }
+    impl<T,Rhs> PartialEq<Wrap<Rhs>> for Wrap<T> where T: PartialEq<Rhs> {
+        fn eq(&self, other: &Wrap<Rhs>) -> bool { self.0.eq(&other.0) }
+    }
+    impl<T> Eq for Wrap<T> where T: Eq {}
+    impl<T,Rhs> PartialOrd<Wrap<Rhs>> for Wrap<T> where T: PartialOrd<Rhs> {
+        fn partial_cmp(&self, other: &Wrap<Rhs>) -> Option<Ordering> { self.0.partial_cmp(&other.0) }
+    }
+    impl<T> Ord for Wrap<T> where T: Ord {
+        fn cmp(&self, other: &Self) -> Ordering { self.0.cmp(&other.0) }
+    }
+    impl<T> Deref for Wrap<T> {
+        type Target = T;
+        fn deref(&self) -> &T { &self.0 }
+    }
+    
+    /*
+    struct Compact(Option<String>);
+    impl Compact {
+        fn new() -> Compact { Compact(None) }
+    }
+
+    const name: CString = CString::new("foo").unwrap();
+    impl Filter for Compact {
+        type Key = String;
+        type Val = String;
+        fn name(&self) -> &CStr { &name }
+        fn filter(&self, _: u32, _: &Self::Key, _: &Self::Val) -> FilterRes<Self::Val> { FilterRes::Preserve }
+        fn stash(&mut self, v: String) -> &String { self.0 = Some(v); self.0.as_ref().unwrap() }
+    }
+     */
+
+    type MyString = Wrap<String>;
+    impl<'a> From<&'a [u8]> for MyString {
+        fn from(bytes: &'a [u8]) -> MyString {
+            Wrap::wrap(From::from(str::from_utf8(bytes).unwrap()))
+        }
+    }
+    
+    #[test]
+    fn options() {
+        let dir = ::testdir();
+        let _ = Options::new()
+//            .compaction_filter(CompactionFilter::new(Compact::new()))
+            .comparator(DefaultCompare::<MyString>::new())
+            .open(dir.path());
     }
 }

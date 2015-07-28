@@ -5,3 +5,6 @@ authors = ["Jeremy Fitzhardinge <jeremy@goop.org>"]
 
 [dependencies]
 libc = "*"
+
+[dev-dependencies]
+tempdir = "0.3.4"
