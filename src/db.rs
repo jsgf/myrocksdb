@@ -74,54 +74,51 @@ impl From<RawBuf> for String {
 /// Represents a reference to a transient C buffer. The lifetime and
 /// the type parameter represent what the buffer is owned by and
 /// therefore borrowed from.
-pub struct RawRef<'a, T: 'a> {
+pub struct RawRef {
     ptr: *mut u8,
     sz: usize,
-    owner: PhantomData<&'a mut T>,
 }
 
-impl<'a, T> RawRef<'a, T>
-    where T: 'a
+impl RawRef
 {
-    unsafe fn new(ptr: *mut c_char, sz: size_t, _owner: &mut T) -> RawRef<'a, T> {
-        RawRef { ptr: ptr as *mut u8, sz: sz as usize, owner: PhantomData }
+    unsafe fn new(ptr: *mut c_char, sz: size_t) -> RawRef {
+        RawRef { ptr: ptr as *mut u8, sz: sz as usize }
     }
 
-    fn as_slice(&'a self) -> &'a [u8] {
+    fn as_slice(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.ptr, self.sz) }
     }
 
-    fn as_mut_slice(&'a mut self) -> &'a mut [u8] {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.ptr, self.sz) }
     }
 }
 
-/*
-impl<'a, T> Deref for RawRef<'a, T>
-    where T: 'a
+impl Deref for RawRef
 {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] { self.as_slice() }
 }
 
-impl<'a, T> DerefMut for RawRef<'a, T>
-    where T: 'a
+impl DerefMut for RawRef
 {
     fn deref_mut(&mut self) -> &mut [u8] { self.as_mut_slice() }
 }
-*/
 
-impl<'a, T> From<RawRef<'a, T>> for Vec<u8>
-    where T: 'a
+impl<'a> From<&'a RawRef> for Vec<u8>
 {
-    fn from(bytes: RawRef<'a, T>) -> Vec<u8> { Vec::from(bytes.as_slice()) }
+    fn from(bytes: &RawRef) -> Vec<u8> { Vec::from(bytes.as_slice()) }
 }
 
-impl<'a, T> From<RawRef<'a, T>> for String
-    where T: 'a
+impl<'a> From<&'a RawRef> for String
 {
-    fn from(bytes: RawRef<'a, T>) -> String { String::from(str::from_utf8(bytes.as_slice()).unwrap()) }
+    fn from(bytes: &RawRef) -> String { String::from(str::from_utf8(bytes.as_slice()).unwrap()) }
+}
+
+impl<'a> From<&'a RawRef> for &'a str
+{
+    fn from(rawref: &RawRef) -> &str { str::from_utf8(rawref.as_slice()).unwrap() }
 }
 
 pub struct ColumnFamily<'a> {
@@ -458,7 +455,7 @@ impl Db {
     // 'db => the iterator can't outlive the db itself
     // 'k => the key can't outlive an iteration
     pub fn iterator_key<'db, K>(&'db self, options: &'db ReadOptions) -> DbIterator<'db, DbIterKey<K>>
-        where for <'k> K: From<RawRef<'k, DbIterator<'db, DbIterKey<K>>>> + 'k
+        where for <'k> K: From<&'k RawRef> + 'k
     {
         DbIterator::new(self, options)
     }
@@ -466,34 +463,78 @@ impl Db {
     // 'db => the iterator can't outlive the db itself
     // 'v => the value can't outlive an iteration
     pub fn iterator_value<'db, V>(&'db self, options: &'db ReadOptions) -> DbIterator<'db, DbIterVal<V>>
-        where for <'v> V: From<RawRef<'v, DbIterator<'db, DbIterVal<V>>>> + 'v
+        where for <'v> V: From<&'v RawRef> + 'v
     {
         DbIterator::new(self, options)
     }
 
     pub fn iterator_key_value<'db, K, V>(&'db self, options: &'db ReadOptions) -> DbIterator<'db, DbIterKeyVal<K, V>>
-        where for <'k> K: From<RawRef<'k, DbIterator<'db, DbIterKey<K>>>> + 'k,
-              for <'v> V: From<RawRef<'v, DbIterator<'db, DbIterVal<V>>>> + 'v
+        where for <'k> K: From<&'k RawRef> + 'k,
+              for <'v> V: From<&'v RawRef> + 'v
     {
         DbIterator::new(self, options)
     }
 }
 
-pub struct DbIterKey<K>(PhantomData<K>);
-pub struct DbIterVal<V>(PhantomData<V>);
-pub struct DbIterKeyVal<K,V>(PhantomData<(K,V)>);
+pub trait DbIterItem<'db, Item> {
+    type T;
+    fn item(&mut DbIterator<'db, Item>) -> Option<Self::T>;
+}
 
+pub struct DbIterKey<K>(PhantomData<K>);
+impl<'db, K> DbIterItem<'db, DbIterKey<K>> for DbIterKey<K>
+    where for <'k> K: From<&'k RawRef>
+{
+    type T = K;
+    fn item(iter: &mut DbIterator<'db, Self>) -> Option<Self::T> { iter.key() }
+}
+
+pub struct DbIterVal<V>(PhantomData<V>);
+impl<'db, V> DbIterItem<'db, DbIterVal<V>> for DbIterVal<V>
+    where for <'v> V: From<&'v RawRef>
+{
+    type T = V;
+    fn item(iter: &mut DbIterator<'db, Self>) -> Option<Self::T> { iter.value() }
+}
+
+pub struct DbIterKeyVal<K,V>(PhantomData<(K,V)>);
+impl<'db, K, V> DbIterItem<'db, DbIterKeyVal<K,V>> for DbIterKeyVal<K, V>
+    where for <'k> K: From<&'k RawRef>,
+          for <'v> V: From<&'v RawRef>
+{
+    type T = (K, V);
+    fn item(iter: &mut DbIterator<'db, Self>) -> Option<Self::T> {
+        let k = iter.key();
+        let v = iter.value();
+        if k.is_some() && v.is_some() {
+            Some((k.unwrap(), v.unwrap()))
+        } else {
+            None
+        }
+    }
+}
+
+/// Iterator over RocksDB.
+///
+/// The iterator maintains a cursor, which may be valid or invalid. If valid, it has an
+/// associated key and value.
+///
+/// Initially the cursor is not valid; it must be positioned with one of the `seek` methods.
 pub struct DbIterator<'db, Item>
+    where Item: DbIterItem<'db, Item>
 {
     iter: *mut ffi::rocksdb_iterator_t,
 
     first: bool,                // don't need advance
-
+    key: Option<RawRef>,
+    val: Option<RawRef>,
+    
     db: PhantomData<&'db Db>,
     item: PhantomData<Item>,
 }
 
 impl<'db, Item> DbIterator<'db, Item>
+    where Item: DbIterItem<'db, Item>
 {
     fn new(db: &'db Db, options: &'db ReadOptions) -> Self {
         let db = db.db();
@@ -503,26 +544,38 @@ impl<'db, Item> DbIterator<'db, Item>
             db: PhantomData,
             item: PhantomData,
             first: true,
+
+            key: None,
+            val: None,
         }
     }
 
+    #[inline]
+    fn reset(&mut self) {
+        self.key = None;
+        self.val = None;
+    }
+    
     #[inline]
     pub fn valid(&self) -> bool {
         unsafe { ffi::rocksdb_iter_valid(self.iter) != 0 }
     }
 
     pub fn seek_first(&mut self) -> &mut Self {
+        self.reset();
         unsafe { ffi::rocksdb_iter_seek_to_first(self.iter) };
         self.first = true;
         self
     }
 
     pub fn seek_last(&mut self) -> &mut Self {
+        self.reset();
         unsafe { ffi::rocksdb_iter_seek_to_last(self.iter) }
         self
     }    
 
     pub fn seek_next(&mut self) -> &mut Self {
+        self.reset();
         if self.valid() {
             unsafe { ffi::rocksdb_iter_next(self.iter) }
         }
@@ -530,157 +583,99 @@ impl<'db, Item> DbIterator<'db, Item>
     }    
 
     pub fn seek_prev(&mut self) -> &mut Self {
+        self.reset();
         if self.valid() {
             unsafe { ffi::rocksdb_iter_prev(self.iter) }
         }
         self
     }    
     
-    pub fn seek<SK>(&mut self, key: &SK) -> &mut Self
-        where SK: AsRef<[u8]>
+    pub fn seek<K>(&mut self, key: &K) -> &mut Self
+        where K: AsRef<[u8]>
     {
         let s = key.as_ref();
         
+        self.reset();
         unsafe { ffi::rocksdb_iter_seek(self.iter, s.as_ptr() as *const c_char, s.len() as size_t) }
         self.first = true;
         self
     }
 
-    pub fn key<'it>(&'it mut self) -> Option<RawRef<'it, Self>> {
+    pub fn key<K>(&mut self) -> Option<K>
+        where K: for <'k> From<&'k RawRef>
+    {
         if !self.valid() { return None }
 
-        unsafe {
-            let mut klen = 0;
-            let kptr = ffi::rocksdb_iter_key(self.iter, &mut klen);
-            
-            Some(RawRef::new(kptr as *mut c_char, klen, self))
+        if self.key.is_none() {
+            unsafe {
+                let mut klen = 0;
+                let kptr = ffi::rocksdb_iter_key(self.iter, &mut klen);
+                
+                self.key = Some(RawRef::new(kptr as *mut c_char, klen))
+            }
         }
+
+        self.key.as_ref().map(K::from)
     }
 
-    pub fn value<'it>(&'it mut self) -> Option<RawRef<'it, Self>> {
+    pub fn value<V>(&mut self) -> Option<V>
+        where V: for <'v> From<&'v RawRef>
+    {
         if !self.valid() { return None }
 
         unsafe {
             let mut klen = 0;
             let kptr = ffi::rocksdb_iter_value(self.iter, &mut klen);
-            Some(RawRef::new(kptr as *mut c_char, klen, self))
+
+            self.val = Some(RawRef::new(kptr as *mut c_char, klen))
         }
+
+        self.val.as_ref().map(V::from)
     }
 }
 
 impl<'db, Item> Drop for DbIterator<'db, Item>
+    where Item: DbIterItem<'db, Item>
 {
     fn drop(&mut self) {
         unsafe { ffi::rocksdb_iter_destroy(self.iter) }
     }
 }
 
-impl<'db, 'it, K> Iterator for DbIterator<'db, DbIterKey<K>>
-    where K: From<RawRef<'it, DbIterator<'db, DbIterKey<K>>>> + 'it + 'db
+impl<'db, Item> Iterator for DbIterator<'db, Item>
+    where Item: DbIterItem<'db, Item>
 {
-    type Item=K;
+    type Item = Item::T;
     
-    fn next(&'it mut self) -> Option<Self::Item> {
+    fn next(&mut self) -> Option<Self::Item> {
         if !self.first {
             self.seek_next();
         }
 
         self.first = false;
-        self.key().map(Self::Item::from)
+        Item::item(self)
     }
 
     fn last(mut self) -> Option<Self::Item> {
         self.seek_last();
         self.first = false;
-        self.key().map(Self::Item::from)
+        Item::item(&mut self)
     }
 }
 
-/*
-impl<'a,K> DoubleEndedIterator for DbIterator<'a,DbIterKey<K>>
-    where K: From<RawRef<'a, DbIterator<'a,DbIterKey<K>>>> + 'a
+impl<'db, Item> DoubleEndedIterator for DbIterator<'db, Item>
+    where Item: DbIterItem<'db, Item>
 {
-    fn next_back<'b>(&'b mut self) -> Option<Self::Item> {
-        self.seek_prev();
-        self.first = false;
-        self.key().map(Self::Item::from)
-    }
-}
-
-impl<'a,V> Iterator for DbIterator<'a,DbIterVal<V>>
-    where V: From<RawRef<'a, DbIterator<'a,DbIterVal<V>>>> + 'a
-{
-    type Item=V;
-    
-    fn next(&mut self) -> Option<V> {
-        if !self.first {
-            self.seek_next();
-        }
-
-        self.first = false;
-        self.value().map(Self::Item::from)
-    }
-
-    fn last(mut self) -> Option<V> {
-        self.seek_last();
-        self.first = false;
-        self.key().map(Self::Item::from)
-    }
-}
-
-impl<'a,V> DoubleEndedIterator for DbIterator<'a,DbIterVal<V>>
-    where V: From<RawBuf>
-{
-    fn next_back(&mut self) -> Option<V> {
-        let ret = self.value();
-        self.seek_prev();
-
-        ret
-    }
-}
-
-impl<'a> Iterator for DbIterator<'a,DbIterKeyVal<K,V>>
-    where K: From<RawBuf>, V: From<RawBuf>
-{
-    type Item=(K,V);
-    
-    fn next(&mut self) -> Option<(K,V)> {
+    fn next_back(&mut self) -> Option<Self::Item> {
         if self.valid() {
-            let ret = (self.key().unwrap(), self.value().unwrap());
-            self.seek_next();
-
-            Some(ret)
-        } else {
-            None
-        }
-    }
-
-    fn last(mut self) -> Option<(K,V)> {
-        self.seek_last();
-
-        if self.valid() {
-            Some((self.key().unwrap(), self.value().unwrap()))
-        } else {
-            None
-        }
-    }
-}
-
-impl<'a, K, V> DoubleEndedIterator for DbIterator<'a,DbIterKeyVal<K,V>>
-    where K: From<RawBuf>, V: From<RawBuf>
-{
-    fn next_back(&mut self) -> Option<(K,V)> {
-        if self.valid() {
-            let ret = (self.key().unwrap(), self.value().unwrap());
+            self.first = false;
             self.seek_prev();
-
-            Some(ret)
+            Item::item(self)
         } else {
             None
         }
     }
 }
- */
 
 pub struct WriteBatch {
     batch: *mut ffi::rocksdb_writebatch_t,
@@ -1114,6 +1109,15 @@ mod test {
         let kset2: BTreeSet<_> = db.iterator_key(&rdopt).seek_first().collect();
         assert_eq!(kset, kset2);
 
+        {
+            let mut iter = db.iterator_key::<Vec<u8>>(&rdopt);
+            iter.seek_first();
+            let a = iter.next().unwrap();
+            let b = iter.next().unwrap();
+
+            assert!(a != b)
+        }
+        
         let kset3: BTreeSet<_> = db.iterator_value(&rdopt).seek_first().collect();
         assert_eq!(kset, kset3);
     }
