@@ -1,4 +1,5 @@
 fn main() {
+    // XXX look to see what's installed
     println!("cargo:rustc-link-lib=static=rocksdb");
     println!("cargo:rustc-link-search=native=/usr/local/lib");
     println!("cargo:root=/path/to/foo");

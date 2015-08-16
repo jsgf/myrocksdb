@@ -7,7 +7,7 @@ use std::iter;
 use std::slice;
 use std::sync::Arc;
 use std::path::Path;
-use std::ffi::CString;
+use std::ffi::{CString,CStr};
 use std::borrow::Borrow;
 use std::marker::PhantomData;
 
@@ -22,6 +22,8 @@ pub struct RawBuf {
     ptr: *mut u8,
     sz: usize
 }
+
+pub const DEFAULT_COLUMN_FAMILY_NAME : &'static str = "default"; // kDefaultColumnFamilyName
 
 /// Raw buffer returned from the database. Users implement `From<RawBuf>` to convert it into some
 /// useful type.
@@ -121,23 +123,24 @@ impl<'a> From<&'a RawRef> for &'a str
     fn from(rawref: &RawRef) -> &str { str::from_utf8(rawref.as_slice()).unwrap() }
 }
 
+#[derive(Debug,Clone)]
 pub struct ColumnFamily<'a> {
-    name: &'a str,
+    name: CString,
     options: &'a Options,
 }
 
 impl<'a> ColumnFamily<'a> {
     pub fn new(name: &'a str, options: &'a Options) -> ColumnFamily<'a> {
-        ColumnFamily { name: name, options: options }
+        ColumnFamily { name: CString::new(name).unwrap(), options: options }
     }
 }
 
-pub struct ColumnFamilyHandle(*mut ffi::rocksdb_column_family_handle_t);
+pub struct ColumnFamilyHandle(*mut ffi::rocksdb_column_family_handle_t, Db);
 
 impl ColumnFamilyHandle {
     // Caller must have corresponding db
-    fn new(_: &Db, handle: *mut ffi::rocksdb_column_family_handle_t) -> ColumnFamilyHandle {
-        ColumnFamilyHandle(handle)
+    fn new(db: Db, handle: *mut ffi::rocksdb_column_family_handle_t) -> ColumnFamilyHandle {
+        ColumnFamilyHandle(handle, db)
     }
 }
 
@@ -164,6 +167,30 @@ impl Drop for DbInner {
 #[derive(Clone, Debug)]
 pub struct Db {
     db: Arc<DbInner>,
+}
+
+pub fn list_column_families<P>(options: &Options, name: P) -> Result<Vec<String>>
+    where P: AsRef<Path>
+{
+    let cname = name.as_ref().as_os_str().to_cstring().unwrap();
+    
+    unsafe {
+        let mut err = ptr::null_mut();
+        let mut len = 0;
+        let ret = ffi::rocksdb_list_column_families(get_options_ptr(options), cname.as_ptr(), &mut len, &mut err);
+
+        if ret.is_null() {
+            Err(Error::from_cptr(err))
+        } else {
+            let names = slice::from_raw_parts(ret, len as usize);
+
+            Ok(names.into_iter()
+               .map(|cstr| CStr::from_ptr(*cstr as *const c_char).to_bytes())
+               .map(|sl| str::from_utf8(sl).unwrap())
+               .map(|s| String::from(s))
+               .collect())
+        }
+    }
 }
 
 unsafe impl Sync for DbInner {}
@@ -203,15 +230,15 @@ impl Db {
         }
     }
 
-    pub fn open_column_families<'a, CFI>(options: &Options, name: &str, families: CFI) -> Result<(Db, Vec<ColumnFamilyHandle>)>
-        where CFI: iter::IntoIterator<Item=ColumnFamily<'a>>
+    pub fn open_column_families<'a, P, CFI>(options: &Options, name: P, families: CFI) -> Result<(Db, Vec<ColumnFamilyHandle>)>
+        where P: AsRef<Path>, CFI: iter::IntoIterator<Item=ColumnFamily<'a>>
     {
-        let cname = CString::new(name).unwrap();
+        let cname = name.as_ref().as_os_str().to_cstring().unwrap();
         
         unsafe {
             let mut err = ptr::null_mut();
             let (fnames, foptions): (Vec<_>, Vec<_>) = families.into_iter()
-                .map(|f| (CString::new(f.name).unwrap().as_bytes().as_ptr() as *const c_char,
+                .map(|f| (f.name.as_ptr() as *const c_char,
                           get_options_ptr(f.options)))
                 .unzip();
             let mut handles: Vec<_> = (0..fnames.len()).map(|_| ptr::null_mut()).collect();
@@ -225,13 +252,73 @@ impl Db {
                 Err(Error::from_cptr(err))
             } else {
                 let db = Db { db: Arc::new(DbInner(ret)) };
-                let hnd = handles.into_iter().map(|h| ColumnFamilyHandle::new(&db, h)).collect();
+                let hnd = handles.into_iter().map(|h| ColumnFamilyHandle::new(db.clone(), h)).collect();
                 
                 Ok((db, hnd))
             }
         }
     }
 
+    pub fn open_for_read_only_column_families<'a, P, CFI>(options: &Options, name: P, families: CFI, error_if_log_exists: bool)
+                                                          -> Result<(Db, Vec<ColumnFamilyHandle>)>
+        where P: AsRef<Path>, CFI: iter::IntoIterator<Item=ColumnFamily<'a>>
+    {
+        let cname = name.as_ref().as_os_str().to_cstring().unwrap();
+        
+        unsafe {
+            let mut err = ptr::null_mut();
+            let (fnames, foptions): (Vec<_>, Vec<_>) = families.into_iter()
+                .map(|f| (f.name.as_ptr() as *const c_char,
+                          get_options_ptr(f.options)))
+                .unzip();
+            let mut handles: Vec<_> = (0..fnames.len()).map(|_| ptr::null_mut()).collect();
+            let ret = ffi::rocksdb_open_for_read_only_column_families(get_options_ptr(options), cname.as_ptr(),
+                                                                      fnames.len() as c_int,
+                                                                      fnames.as_ptr(),
+                                                                      foptions.as_ptr(),
+                                                                      handles.as_mut_ptr(),
+                                                                      error_if_log_exists as c_uchar, &mut err);
+
+            if ret.is_null() {
+                Err(Error::from_cptr(err))
+            } else {
+                let db = Db { db: Arc::new(DbInner(ret)) };
+                let hnd = handles.into_iter().map(|h| ColumnFamilyHandle::new(db.clone(), h)).collect();
+                
+                Ok((db, hnd))
+            }
+        }
+    }
+
+    pub fn create_column_family(&self, options: &Options, name: &str) -> Result<ColumnFamilyHandle> {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let cname = CString::new(name).unwrap();
+            let ret = ffi::rocksdb_create_column_family(self.db.as_ptr(), get_options_ptr(options), cname.as_ptr(), &mut err);
+
+            if !err.is_null() {
+                Err(Error::from_cptr(err))
+            } else {
+                assert!(!ret.is_null());
+                Ok(ColumnFamilyHandle::new(self.clone(), ret))
+            }
+        }
+    }
+
+    pub fn drop_column_family(&self, cf: &ColumnFamilyHandle) -> Result<()> {
+        unsafe {
+            let mut err = ptr::null_mut();
+
+            ffi::rocksdb_drop_column_family(self.db.as_ptr(), cf.0, &mut err);
+
+            if !err.is_null() {
+                Err(Error::from_cptr(err))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    
     pub fn put<K, V>(&self, options: &WriteOptions, key: K, val: V) -> Result<()>
         where K: AsRef<[u8]>, V: AsRef<[u8]>
     {
@@ -452,16 +539,12 @@ impl Db {
         }        
     }
 
-    // 'db => the iterator can't outlive the db itself
-    // 'k => the key can't outlive an iteration
     pub fn iterator_key<'db, K>(&'db self, options: &'db ReadOptions) -> DbIterator<'db, DbIterKey<K>>
         where for <'k> K: From<&'k RawRef> + 'k
     {
         DbIterator::new(self, options)
     }
 
-    // 'db => the iterator can't outlive the db itself
-    // 'v => the value can't outlive an iteration
     pub fn iterator_value<'db, V>(&'db self, options: &'db ReadOptions) -> DbIterator<'db, DbIterVal<V>>
         where for <'v> V: From<&'v RawRef> + 'v
     {
@@ -473,6 +556,25 @@ impl Db {
               for <'v> V: From<&'v RawRef> + 'v
     {
         DbIterator::new(self, options)
+    }
+
+    pub fn iterator_cf_key<'db, K>(&'db self, options: &'db ReadOptions, cf: &'db ColumnFamilyHandle) -> DbIterator<'db, DbIterKey<K>>
+        where for <'k> K: From<&'k RawRef> + 'k
+    {
+        DbIterator::new_cf(self, options, cf)
+    }
+
+    pub fn iterator_cf_value<'db, V>(&'db self, options: &'db ReadOptions, cf: &'db ColumnFamilyHandle) -> DbIterator<'db, DbIterVal<V>>
+        where for <'v> V: From<&'v RawRef> + 'v
+    {
+        DbIterator::new_cf(self, options, cf)
+    }
+
+    pub fn iterator_cf_key_value<'db, K, V>(&'db self, options: &'db ReadOptions, cf: &'db ColumnFamilyHandle) -> DbIterator<'db, DbIterKeyVal<K, V>>
+        where for <'k> K: From<&'k RawRef> + 'k,
+              for <'v> V: From<&'v RawRef> + 'v
+    {
+        DbIterator::new_cf(self, options, cf)
     }
 }
 
@@ -550,6 +652,20 @@ impl<'db, Item> DbIterator<'db, Item>
         }
     }
 
+    fn new_cf(db: &'db Db, options: &'db ReadOptions, cf: &'db ColumnFamilyHandle) -> Self {
+        let db = db.db();
+
+        DbIterator {
+            iter: unsafe { ffi::rocksdb_create_iterator_cf(db.as_ptr(), options.options, cf.0) },
+            db: PhantomData,
+            item: PhantomData,
+            first: true,
+
+            key: None,
+            val: None,
+        }
+    }
+    
     #[inline]
     fn reset(&mut self) {
         self.key = None;
@@ -1067,8 +1183,8 @@ impl Drop for WriteOptions {
 
 #[cfg(test)]
 mod test {
+    use super::*;
     use ::Options;
-    use ::{ReadOptions,WriteOptions};
     use std::collections::btree_set::BTreeSet;
     
     #[test]
@@ -1096,13 +1212,13 @@ mod test {
         let wropt = WriteOptions::new();
         let rdopt = ReadOptions::new();
 
-        let kset: BTreeSet<_> = vec!["foo","bar","blat"].into_iter().map(Vec::from).collect();
+        let kset: BTreeSet<_> = vec!["foo","bar","blat"].into_iter().map(String::from).collect();
         for k in kset.iter() {
             db.put(&wropt, k, k).unwrap()
         }
 
         for k in kset.iter() {
-            let v : Vec<_> = db.get(&rdopt, k).unwrap();
+            let v: String = db.get(&rdopt, k).unwrap();
             assert_eq!(&v, k);
         }
         
@@ -1110,7 +1226,7 @@ mod test {
         assert_eq!(kset, kset2);
 
         {
-            let mut iter = db.iterator_key::<Vec<u8>>(&rdopt);
+            let mut iter = db.iterator_key::<String>(&rdopt);
             iter.seek_first();
             let a = iter.next().unwrap();
             let b = iter.next().unwrap();
@@ -1120,5 +1236,91 @@ mod test {
         
         let kset3: BTreeSet<_> = db.iterator_value(&rdopt).seek_first().collect();
         assert_eq!(kset, kset3);
+    }
+
+    #[test]
+    fn batch() {
+        let dir = ::testdir();
+        let db = Options::new()
+            .error_if_exists(true)
+            .create_if_missing(true)
+            .open(dir.path()).unwrap();
+        let wropt = WriteOptions::new();
+        let rdopt = ReadOptions::new();
+
+        let kset: BTreeSet<_> = vec!["foo","bar","blat"].into_iter().map(String::from).collect();
+
+        let mut batch = WriteBatch::new();
+
+        for k in kset.iter() {
+            batch.put(k, k)
+        }
+
+        db.write(&wropt, batch).unwrap();
+
+        let kset2: BTreeSet<_> = db.iterator_key(&rdopt).seek_first().collect();
+        assert_eq!(kset, kset2);
+
+        let mut batch = WriteBatch::new();
+
+        for k in kset.iter() {
+            batch.delete(k)
+        }
+
+        db.write(&wropt, batch).unwrap();
+
+        let kset3: BTreeSet<String> = db.iterator_key(&rdopt).seek_first().collect();
+        assert!(kset3.is_empty());
+    }
+
+    #[test]
+    fn colfamilies() {
+        let opts = Options::new();
+        let dir = ::testdir();
+        let mut dbopts = Options::new();
+        dbopts.create_if_missing(true);
+        let wropt = WriteOptions::new();
+        let rdopt = ReadOptions::new();
+        let kset: BTreeSet<_> = vec!["foo","bar","blat"].into_iter().map(String::from).collect();
+
+        {
+            let db = Db::open(&dbopts, dir.path()).unwrap();
+            //let _ = db.create_column_family(&dbopts, DEFAULT_COLUMN_FAMILY_NAME).unwrap();
+            let _ = db.create_column_family(&dbopts, "foo").unwrap();
+            let _ = db.create_column_family(&dbopts, "bar").unwrap();
+            let _ = db.create_column_family(&dbopts, "blat").unwrap();
+        }
+
+        println!("col families: {:?}", list_column_families(&dbopts, dir.path()).unwrap());
+
+        let cf = vec![ColumnFamily::new(DEFAULT_COLUMN_FAMILY_NAME, &opts),
+                      ColumnFamily::new("foo", &opts),
+                      ColumnFamily::new("bar", &opts),
+                      ColumnFamily::new("blat", &opts)];
+
+        {
+            let (db, cfs) = Db::open_column_families(&dbopts, dir.path(), cf.clone()).unwrap();
+
+            for k in kset.iter() {
+                db.put_cf(&wropt, &cfs[1], k, k).unwrap()
+            }
+
+            let kset2: BTreeSet<_> = db.iterator_cf_key(&rdopt, &cfs[1]).seek_first().collect();
+            assert_eq!(kset, kset2);
+        }
+
+        {
+            let (db, cfs) = Db::open_column_families(&dbopts, dir.path(), cf.clone()).unwrap();
+
+            let kset2: BTreeSet<_> = db.iterator_cf_key(&rdopt, &cfs[1]).seek_first().collect();
+            assert_eq!(kset, kset2);
+        }
+
+        {
+            let (db, cfs) = Db::open_for_read_only_column_families(&dbopts, dir.path(), cf.clone(), false).unwrap();
+
+            let kset2: BTreeSet<_> = db.iterator_cf_key(&rdopt, &cfs[1]).seek_first().collect();
+            assert_eq!(kset, kset2);
+        }
     }
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["Jeremy Fitzhardinge <jeremy@goop.org>"]
 
 [dependencies]
-libc = "*"
+rocksdb-sys = "git@github.com:jsgf/rocksdb-sys.git"
 
 [dev-dependencies]
 tempdir = "0.3.4"
