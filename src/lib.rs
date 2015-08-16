@@ -21,6 +21,7 @@
 //#![warn(missing_docs)]
 
 extern crate libc;
+extern crate rocksdb_sys as ffi;
 
 use libc::{c_char, c_void};
 use std::ffi::CStr;
@@ -29,7 +30,6 @@ use std::fmt;
 use std::str;
 use std::result;
 
-mod ffi;
 pub mod db;
 mod options;                    // not every pub thing in options should be exported
 
