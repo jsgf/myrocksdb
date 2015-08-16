@@ -82,7 +82,7 @@ pub const rocksdb_fifo_compaction: c_uint = 2;
 pub const rocksdb_similar_size_compaction_stop_style: c_uint = 0;
 pub const rocksdb_total_size_compaction_stop_style: c_uint = 1;
 
-#[link(name = "rocksdb")]
+#[link(name = "rocksdb", kind = "static")]
 extern "C" {
     pub fn rocksdb_open(options: *const rocksdb_options_t,
                         name: *const c_char,
@@ -128,8 +128,8 @@ extern "C" {
     pub fn rocksdb_open_for_read_only_column_families(options: *const rocksdb_options_t,
                                                       name: *const c_char,
                                                       num_column_families: c_int,
-                                                      column_family_names: *mut *const c_char,
-                                                      column_family_options: *mut *const rocksdb_options_t,
+                                                      column_family_names: *const *const c_char,
+                                                      column_family_options: *const *mut rocksdb_options_t,
                                                       column_family_handles: *mut *mut rocksdb_column_family_handle_t,
                                                       error_if_log_file_exist: c_uchar,
                                                       errptr: *mut *mut c_char) -> *mut rocksdb_t;
