@@ -18,6 +18,9 @@ use super::{Error, Result, ffi};
 use super::ffi::rocksdb_t;
 use super::options::{Options, get_options_ptr};
 
+/// `RawBuf` is a reference to a range of memory owned by RocksDB
+/// itself, on the C heap. The underlying memory can be viewed and
+/// modified, and the memory is freed when the `RawBuf` is dropped.
 pub struct RawBuf {
     ptr: *mut u8,
     sz: usize
@@ -73,9 +76,8 @@ impl From<RawBuf> for String {
     fn from(bytes: RawBuf) -> String { String::from(str::from_utf8(bytes.as_ref()).unwrap()) }
 }
 
-/// Represents a reference to a transient C buffer. The lifetime and
-/// the type parameter represent what the buffer is owned by and
-/// therefore borrowed from.
+/// Represents a reference to a transient C buffer.  Ownership is
+/// retained by this crate, but clients can borrow it for a while.
 pub struct RawRef {
     ptr: *mut u8,
     sz: usize,
@@ -123,7 +125,7 @@ impl<'a> From<&'a RawRef> for &'a str
     fn from(rawref: &RawRef) -> &str { str::from_utf8(rawref.as_slice()).unwrap() }
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct ColumnFamily<'a> {
     name: CString,
     options: &'a Options,
@@ -1321,6 +1323,38 @@ mod test {
 
             let kset2: BTreeSet<_> = db.iterator_cf_key(&rdopt, &cfs[1]).seek_first().collect();
             assert_eq!(kset, kset2);
+        }
+    }
+
+    #[test]
+    fn multithread() {
+        use std::thread;
+        use std::str::FromStr;
+
+        let primes = vec![2, 3, 5, 7, 11, 13, 17, 19, 23];
+
+        fn mtdb(db: Db, p: u32) {
+            let wropt = WriteOptions::new();
+
+            for i in 0..1000 {
+                if i % p != 0 { continue }
+
+                let s = format!("{}", p);
+                let _ = db.put(&wropt, &s, &s).unwrap();
+            }
+        }
+
+        let dir = ::testdir();
+        let db = Options::new().create_if_missing(true).open(dir.path()).unwrap();
+        let kids: Vec<_> = primes.clone().into_iter()
+            .map(|p| { let db = db.clone(); thread::spawn(move || mtdb(db, p)) }).collect();
+
+        let _: Vec<_> = kids.into_iter().map(|t| t.join()).collect();
+
+        let rdopt = ReadOptions::new();
+        for k in db.iterator_key::<String>(&rdopt) {
+            let v = FromStr::from_str(&k).unwrap();
+            assert!(primes.iter().any(|p| *p == v));
         }
     }
 }

@@ -2,12 +2,14 @@
 name = "myrocksdb"
 version = "0.1.0"
 authors = ["Jeremy Fitzhardinge <jeremy@goop.org>"]
+license = "MIT/Apache-2.0/BSD"
+description = "Complete, efficient, safe, correct, ergonomic bindings to RocksDB"
+keywords = [ "rocksdb", "database" ]
+readme = "README.md"
 
 [dependencies]
 libc = "0.1.8"
-
-[dependencies.rocksdb-sys]
-git = "https://github.com/jsgf/rocksdb-sys.git"
+rocksdb-sys = "*"
 
 [dev-dependencies]
 tempdir = "0.3.4"

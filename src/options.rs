@@ -11,8 +11,6 @@ use libc::{c_uchar, c_char, c_int, c_uint, c_double, c_void, uint64_t, uint32_t,
 use super::{Db,Result};
 use super::ffi;
 
-#[allow(raw_pointer_derive)]
-
 /// Options for constructing or accessing a RocksDB instance.
 ///
 /// `Options` follows the builder pattern, whereby one can either construct and open a db in a
@@ -41,6 +39,7 @@ use super::ffi;
 /// let db = Db::open(&opts, Path::new("foo"));
 /// ```
 
+#[allow(raw_pointer_derive)]
 #[derive(Debug)]
 pub struct Options {
     options: *mut ffi::rocksdb_options_t,
