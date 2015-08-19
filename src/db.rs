@@ -1188,7 +1188,8 @@ mod test {
     use super::*;
     use ::Options;
     use std::collections::btree_set::BTreeSet;
-    
+
+    // Simple open and close
     #[test]
     fn simple() {
         let dir = ::testdir();
@@ -1204,6 +1205,40 @@ mod test {
         assert_eq!(db.get(&rdopt, "foo"), Ok(String::from("bar")));
     }
 
+    #[test]
+    fn lifetimes() {
+        let dir = ::testdir();
+        let wropt = WriteOptions::new();
+        let rdopt = ReadOptions::new();
+        let db;
+        {
+            let mut opts = Options::new();
+            opts.create_if_missing(true);
+            db = Some(Db::open(opts, dir.path()).unwrap());
+        }
+
+        if let Some(db) = db {
+            db.put(&wropt, "foo", "bar").unwrap();
+            assert_eq!(db.get(&rdopt, "foo"), Ok(Vec::from("bar")));
+        }
+    }
+    
+    // Check db access is exclusive
+    #[test]
+    fn excl() {
+        let dir = ::testdir();
+        let db = Options::new()
+            .create_if_missing(true)
+            .open(dir.path());
+        let db2 = Options::new()
+            .create_if_missing(true)
+            .open(dir.path());
+
+        assert!(db.is_ok());
+        assert!(db2.is_err());
+    }
+
+    // Test iterators
     #[test]
     fn iter() {
         let dir = ::testdir();
@@ -1240,6 +1275,7 @@ mod test {
         assert_eq!(kset, kset3);
     }
 
+    // Batched updates
     #[test]
     fn batch() {
         let dir = ::testdir();
@@ -1275,25 +1311,28 @@ mod test {
         assert!(kset3.is_empty());
     }
 
+    // Column families
     #[test]
     fn colfamilies() {
         let opts = Options::new();
         let dir = ::testdir();
-        let mut dbopts = Options::new();
-        dbopts.create_if_missing(true);
+        fn dbopts() -> Options {
+            *Options::new().create_if_missing(true)
+        }
         let wropt = WriteOptions::new();
         let rdopt = ReadOptions::new();
         let kset: BTreeSet<_> = vec!["foo","bar","blat"].into_iter().map(String::from).collect();
 
         {
-            let db = Db::open(&dbopts, dir.path()).unwrap();
+            let db = Db::open(dbopts(), dir.path()).unwrap();
             //let _ = db.create_column_family(&dbopts, DEFAULT_COLUMN_FAMILY_NAME).unwrap();
+            let dbopts = dbopts();
             let _ = db.create_column_family(&dbopts, "foo").unwrap();
             let _ = db.create_column_family(&dbopts, "bar").unwrap();
             let _ = db.create_column_family(&dbopts, "blat").unwrap();
         }
 
-        println!("col families: {:?}", list_column_families(&dbopts, dir.path()).unwrap());
+        println!("col families: {:?}", list_column_families(&dbopts(), dir.path()).unwrap());
 
         let cf = vec![ColumnFamily::new(DEFAULT_COLUMN_FAMILY_NAME, &opts),
                       ColumnFamily::new("foo", &opts),
@@ -1301,7 +1340,7 @@ mod test {
                       ColumnFamily::new("blat", &opts)];
 
         {
-            let (db, cfs) = Db::open_column_families(&dbopts, dir.path(), cf.clone()).unwrap();
+            let (db, cfs) = Db::open_column_families(dbopts(), dir.path(), cf.clone()).unwrap();
 
             for k in kset.iter() {
                 db.put_cf(&wropt, &cfs[1], k, k).unwrap()
@@ -1312,20 +1351,21 @@ mod test {
         }
 
         {
-            let (db, cfs) = Db::open_column_families(&dbopts, dir.path(), cf.clone()).unwrap();
+            let (db, cfs) = Db::open_column_families(dbopts(), dir.path(), cf.clone()).unwrap();
 
             let kset2: BTreeSet<_> = db.iterator_cf_key(&rdopt, &cfs[1]).seek_first().collect();
             assert_eq!(kset, kset2);
         }
 
         {
-            let (db, cfs) = Db::open_for_read_only_column_families(&dbopts, dir.path(), cf.clone(), false).unwrap();
+            let (db, cfs) = Db::open_for_read_only_column_families(dbopts(), dir.path(), cf.clone(), false).unwrap();
 
             let kset2: BTreeSet<_> = db.iterator_cf_key(&rdopt, &cfs[1]).seek_first().collect();
             assert_eq!(kset, kset2);
         }
     }
 
+    // Multithreaded access
     #[test]
     fn multithread() {
         use std::thread;
@@ -1336,6 +1376,8 @@ mod test {
         fn mtdb(db: Db, p: u32) {
             let wropt = WriteOptions::new();
 
+            thread::park();
+            
             for i in 0..1000 {
                 if i % p != 0 { continue }
 
@@ -1349,7 +1391,12 @@ mod test {
         let kids: Vec<_> = primes.clone().into_iter()
             .map(|p| { let db = db.clone(); thread::spawn(move || mtdb(db, p)) }).collect();
 
-        let _: Vec<_> = kids.into_iter().map(|t| t.join()).collect();
+        for h in &kids {
+            h.thread().unpark();
+        }
+        
+        let ok = kids.into_iter().all(|t| t.join().is_ok());
+        assert!(ok);
 
         let rdopt = ReadOptions::new();
         for k in db.iterator_key::<String>(&rdopt) {
