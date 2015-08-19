@@ -1214,7 +1214,7 @@ mod test {
         {
             let mut opts = Options::new();
             opts.create_if_missing(true);
-            db = Some(Db::open(opts, dir.path()).unwrap());
+            db = Some(Db::open(&opts, dir.path()).unwrap());
         }
 
         if let Some(db) = db {
@@ -1317,14 +1317,16 @@ mod test {
         let opts = Options::new();
         let dir = ::testdir();
         fn dbopts() -> Options {
-            *Options::new().create_if_missing(true)
+            let mut opts = Options::new();
+            opts.create_if_missing(true);
+            opts
         }
         let wropt = WriteOptions::new();
         let rdopt = ReadOptions::new();
         let kset: BTreeSet<_> = vec!["foo","bar","blat"].into_iter().map(String::from).collect();
 
         {
-            let db = Db::open(dbopts(), dir.path()).unwrap();
+            let db = Db::open(&dbopts(), dir.path()).unwrap();
             //let _ = db.create_column_family(&dbopts, DEFAULT_COLUMN_FAMILY_NAME).unwrap();
             let dbopts = dbopts();
             let _ = db.create_column_family(&dbopts, "foo").unwrap();
@@ -1340,7 +1342,7 @@ mod test {
                       ColumnFamily::new("blat", &opts)];
 
         {
-            let (db, cfs) = Db::open_column_families(dbopts(), dir.path(), cf.clone()).unwrap();
+            let (db, cfs) = Db::open_column_families(&dbopts(), dir.path(), cf.clone()).unwrap();
 
             for k in kset.iter() {
                 db.put_cf(&wropt, &cfs[1], k, k).unwrap()
@@ -1351,14 +1353,14 @@ mod test {
         }
 
         {
-            let (db, cfs) = Db::open_column_families(dbopts(), dir.path(), cf.clone()).unwrap();
+            let (db, cfs) = Db::open_column_families(&dbopts(), dir.path(), cf.clone()).unwrap();
 
             let kset2: BTreeSet<_> = db.iterator_cf_key(&rdopt, &cfs[1]).seek_first().collect();
             assert_eq!(kset, kset2);
         }
 
         {
-            let (db, cfs) = Db::open_for_read_only_column_families(dbopts(), dir.path(), cf.clone(), false).unwrap();
+            let (db, cfs) = Db::open_for_read_only_column_families(&dbopts(), dir.path(), cf.clone(), false).unwrap();
 
             let kset2: BTreeSet<_> = db.iterator_cf_key(&rdopt, &cfs[1]).seek_first().collect();
             assert_eq!(kset, kset2);
