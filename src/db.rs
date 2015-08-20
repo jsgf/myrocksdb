@@ -580,7 +580,9 @@ impl Db {
     }
 }
 
-pub trait DbIterItem<'db, Item> {
+pub trait DbIterItem<'db, Item>
+    where Item: DbIterItem<'db, Item>
+{
     type T;
     fn item(&mut DbIterator<'db, Item>) -> Option<Self::T>;
 }
@@ -1214,13 +1216,11 @@ mod test {
         {
             let mut opts = Options::new();
             opts.create_if_missing(true);
-            db = Some(Db::open(&opts, dir.path()).unwrap());
+            db = Db::open(&opts, dir.path()).unwrap();
         }
 
-        if let Some(db) = db {
-            db.put(&wropt, "foo", "bar").unwrap();
-            assert_eq!(db.get(&rdopt, "foo"), Ok(Vec::from("bar")));
-        }
+        db.put(&wropt, "foo", "bar").unwrap();
+        assert_eq!(db.get(&rdopt, "foo"), Ok(Vec::from("bar")));
     }
     
     // Check db access is exclusive
