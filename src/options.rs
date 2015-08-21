@@ -1,4 +1,4 @@
-use std::ffi::{CString, CStr};
+use std::ffi::CStr;
 use std::cmp::Ordering;
 use std::mem;
 use std::slice;
@@ -10,6 +10,7 @@ use libc::{c_uchar, c_char, c_int, c_uint, c_double, c_void, uint64_t, uint32_t,
 
 use super::{Db,Result};
 use super::ffi;
+use db::Comparator;
 
 /// Options for constructing or accessing a RocksDB instance.
 ///
@@ -221,15 +222,8 @@ pub trait FilterFactory<'a, F>
     fn name(&self) -> &CStr;    
 }
 
-pub trait Comparator<'a> {
-    type Key: From<&'a [u8]>;
-    
-    fn name(&self) -> &CStr;
-    fn compare(&self, a: &Self::Key, b: &Self::Key) -> Ordering;
-}
-
-extern fn comparator_drop_cb<'a, C>(ptr: *mut c_void)
-    where C: Comparator<'a>
+extern fn comparator_drop_cb<C>(ptr: *mut c_void)
+    where C: Comparator
 {
     let ptr = ptr as *mut C;
     unsafe {
@@ -237,8 +231,8 @@ extern fn comparator_drop_cb<'a, C>(ptr: *mut c_void)
     }
 }
 
-extern fn comparator_name_cb<'a, C>(ptr: *mut c_void) -> *const c_char
-    where C: Comparator<'a>
+extern fn comparator_name_cb<C>(ptr: *mut c_void) -> *const c_char
+    where C: Comparator
 {
     let ptr = ptr as *const Box<C>;
 
@@ -246,10 +240,10 @@ extern fn comparator_name_cb<'a, C>(ptr: *mut c_void) -> *const c_char
     s.as_ptr()
 }
 
-extern fn comparator_compare_cb<'a, C>(ptr: *mut c_void,
-                                       aptr: *const c_char, alen: size_t,
-                                       bptr: *const c_char, blen: size_t) -> c_int
-    where C: Comparator<'a>
+extern fn comparator_compare_cb<C>(ptr: *mut c_void,
+                                   aptr: *const c_char, alen: size_t,
+                                   bptr: *const c_char, blen: size_t) -> c_int
+    where C: Comparator
 {
     let ptr = ptr as *const Box<C>;
 
@@ -264,24 +258,6 @@ extern fn comparator_compare_cb<'a, C>(ptr: *mut c_void,
             Ordering::Greater => 1,
         }
     }
-}
-
-pub struct DefaultCompare<'a, K>(CString, PhantomData<(&'a K)>)
-    where K: From<&'a [u8]> + Ord + 'a;
-
-impl<'a, T> DefaultCompare<'a, T>
-    where T: From<&'a [u8]> + Ord + 'a
-{
-    pub fn new() -> DefaultCompare<'a, T> { DefaultCompare(CString::new("default").unwrap(), PhantomData) }
-}
-
-impl<'a, T> Comparator<'a> for DefaultCompare<'a, T>
-    where T: From<&'a [u8]> + Ord + 'a
-{
-    type Key = T;
-
-    fn name<'b>(&'b self) -> &'b CStr { &self.0 }
-    fn compare(&self, a: &T, b: &T) -> Ordering { a.cmp(b) }
 }
 
 // TBD
@@ -483,8 +459,8 @@ impl Options {
     /// REQUIRES: The client must ensure that the comparator supplied here has the same name and
     /// orders keys *exactly* the same as the comparator provided to previous open calls on the same
     /// DB.
-    pub fn comparator<'a, C>(&mut self, cmp: C) -> &mut Options
-        where C: Comparator<'a>
+    pub fn comparator<C>(&mut self, cmp: C) -> &mut Options
+        where C: Comparator
     {
         unsafe {
             let cmp = ffi::rocksdb_comparator_create(Box::into_raw(Box::new(cmp)) as *mut c_void,
@@ -1105,11 +1081,12 @@ impl Drop for BlockBasedTableOptions {
 #[allow(unused_imports)]
 #[cfg(test)]
 mod test {
-    use super::{Options, DefaultCompare, CompactionFilter, Filter, FilterRes};
+    use super::*;
     use std::ffi::{CString, CStr};
     use std::str;
     use std::ops::Deref;
     use std::cmp::{Ord,Ordering};
+    use db::DefaultCompare;
 
     struct Wrap<T>(T);
     impl<T> Wrap<T> {

@@ -5,11 +5,13 @@ use std::vec;
 use std::ops::{Deref,DerefMut};
 use std::iter;
 use std::slice;
+use std::result;
 use std::sync::Arc;
 use std::path::Path;
 use std::ffi::{CString,CStr};
 use std::borrow::Borrow;
 use std::marker::PhantomData;
+use std::cmp::Ordering;
 
 use libc;
 use libc::{c_uchar, c_char, c_int, size_t, c_void};
@@ -150,6 +152,31 @@ impl Drop for ColumnFamilyHandle {
     fn drop(&mut self) {
         unsafe { ffi::rocksdb_column_family_handle_destroy(self.0) }
     }
+}
+
+pub trait Comparator {
+    type Key: for <'a> From<&'a [u8]>;
+
+    fn name(&self) -> &CStr;
+    fn compare(&self, a: &Self::Key, b: &Self::Key) -> Ordering;
+}
+
+pub struct DefaultCompare<K>(CString, PhantomData<K>)
+    where K: for <'a> From<&'a [u8]> + Ord;
+
+impl<T> DefaultCompare<T>
+    where for <'a> T: From<&'a [u8]> + Ord + 'a
+{
+    pub fn new() -> DefaultCompare<T> { DefaultCompare(CString::new("default").unwrap(), PhantomData) }
+}
+
+impl<T> Comparator for DefaultCompare<T>
+    where for <'a> T: From<&'a [u8]> + Ord
+{
+    type Key = T;
+
+    fn name(&self) -> &CStr { &self.0 }
+    fn compare(&self, a: &T, b: &T) -> Ordering { a.cmp(b) }
 }
 
 #[allow(raw_pointer_derive)]

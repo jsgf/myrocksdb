@@ -34,9 +34,9 @@ pub mod db;
 mod options;                    // not every pub thing in options should be exported
 
 pub use db::{Db, ReadOptions, WriteOptions, RawBuf};
-pub use options::{Options, CompactionFilter, Comparator, DefaultCompare, MergeOperator, SliceTransform, AccessHint,
-                  CompactionStyle, UniversalCompactionOptions, FifoCompactionOptions, FilterFactory, Filter, FilterRes, CompactionFilterContext,
-                  BlockBasedTableOptions, Compression, Cache, TableVersion, ChecksumType, IndexType};
+pub use options::{Options, CompactionFilter, MergeOperator, SliceTransform, AccessHint,
+                  CompactionStyle, UniversalCompactionOptions, FifoCompactionOptions, FilterFactory, Filter, FilterRes,
+                  CompactionFilterContext, BlockBasedTableOptions, Compression, Cache, TableVersion, ChecksumType, IndexType};
 
 #[derive(Debug,PartialEq,Eq,PartialOrd,Ord)]
 /// All errors returned from RocksDB.
