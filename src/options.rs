@@ -1,6 +1,7 @@
 use std::ffi::CStr;
 use std::cmp::Ordering;
 use std::mem;
+use std::ptr;
 use std::slice;
 use std::path::Path;
 use std::marker::PhantomData;
@@ -10,7 +11,7 @@ use libc::{c_uchar, c_char, c_int, c_uint, c_double, c_void, uint64_t, uint32_t,
 
 use super::{Db,Result};
 use super::ffi;
-use db::Comparator;
+use db::{Comparator, Merge};
 
 /// Options for constructing or accessing a RocksDB instance.
 ///
@@ -260,14 +261,78 @@ extern fn comparator_compare_cb<C>(ptr: *mut c_void,
     }
 }
 
-// TBD
-pub struct MergeOperator {
+pub struct MergeOperator<M: Merge> {
     mergeoperator: *mut ffi::rocksdb_mergeoperator_t,
+    merge: PhantomData<M>
 }
 
-impl Drop for MergeOperator {
+impl<M> Drop for MergeOperator<M>
+    where M: Merge
+{
     fn drop(&mut self) {
         unsafe { ffi::rocksdb_mergeoperator_destroy(self.mergeoperator); }        
+    }
+}
+
+extern fn merge_destructor_cb<M>(arg: *mut c_void)
+    where M: Merge
+{
+    //XXX
+}
+
+extern fn merge_full_cb<M>(arg: *mut c_void,
+                           key: *const c_char, key_len: size_t,
+                           existing_val: *const c_char, existing_val_len: size_t,
+                           operands_list: *const *const c_char, operands_list_len: *const size_t,
+                           num_operands: c_int,
+                           success: *mut c_uchar,
+                           new_value_len: *mut size_t) -> *mut c_char
+    where M: Merge
+{
+    //XXX
+    ptr::null_mut()
+}
+
+extern fn merge_partial_cb<M>(arg: *mut c_void,
+                              key: *const c_char, key_len: size_t,
+                              operands_list: *const *const c_char, operands_list_len: *const size_t,
+                              num_operands: c_int,
+                              success: *mut c_uchar,
+                              new_value_len: *mut size_t) -> *mut c_char
+    where M: Merge
+{
+    //XXX
+    ptr::null_mut()
+}
+
+extern fn merge_freeval_cb<M>(arg: *mut c_void, val: *const c_char, val_len: size_t)
+    where M: Merge
+{
+}
+
+extern fn merge_name_cb<M>(arg: *mut c_void) -> *const c_char
+    where M: Merge
+{
+    //XXX
+    ptr::null_mut()
+}
+
+// XXX tie M to Options/Db?
+impl<M> MergeOperator<M>
+    where M: Merge
+{
+    /* TBD pub */ fn new(merge: M) -> MergeOperator<M>
+    {
+        unsafe {
+            let m = ffi::rocksdb_mergeoperator_create(Box::into_raw(Box::new(merge)) as *mut c_void,
+                                                      Some(merge_destructor_cb::<M>),
+                                                      Some(merge_full_cb::<M>),
+                                                      Some(merge_partial_cb::<M>),
+                                                      Some(merge_freeval_cb::<M>),
+                                                      Some(merge_name_cb::<M>));
+
+            MergeOperator { mergeoperator: m, merge: PhantomData }
+        }
     }
 }
 
@@ -474,7 +539,9 @@ impl Options {
         self
     }
 
-    pub fn merge_operator(&mut self, merge: MergeOperator) -> &mut Options {
+    pub fn merge_operator<M>(&mut self, merge: MergeOperator<M>) -> &mut Options
+        where M: Merge
+    {
         unsafe { ffi::rocksdb_options_set_merge_operator(self.options, merge.mergeoperator) };
         self
     }

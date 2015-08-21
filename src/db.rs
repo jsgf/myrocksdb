@@ -28,7 +28,7 @@ pub struct RawBuf {
     sz: usize
 }
 
-pub const DEFAULT_COLUMN_FAMILY_NAME : &'static str = "default"; // kDefaultColumnFamilyName
+pub const DEFAULT_COLUMN_FAMILY_NAME: &'static str = "default"; // kDefaultColumnFamilyName
 
 /// Raw buffer returned from the database. Users implement `From<RawBuf>` to convert it into some
 /// useful type.
@@ -177,6 +177,42 @@ impl<T> Comparator for DefaultCompare<T>
 
     fn name(&self) -> &CStr { &self.0 }
     fn compare(&self, a: &T, b: &T) -> Ordering { a.cmp(b) }
+}
+
+pub trait AssocMerge: AsRef<[u8]> + for <'a> From<&'a RawRef> + Sized {
+    type Key: for <'k> From<&'k RawRef>;
+
+    fn name(&self) -> &CStr;
+    fn merge(key: &Self::Key, current: Option<&Self>, value: &Self) -> result::Result<Self, ()>;
+}
+
+pub trait Merge: AsRef<[u8]> + for <'a> From<&'a RawRef> + Sized {
+    type Key: for <'k> From<&'k RawRef>;
+    type Delta: for <'a> From<&'a RawRef>;
+
+    fn name(&self) -> &CStr;
+    fn fullmerge(key: &Self::Key, current: Option<&Self>, value: &Self::Delta) -> result::Result<Self, ()>;
+    fn partialmerge(key: &Self::Key, left: &Self::Delta, right: &Self::Delta) -> Option<Self::Delta>;
+}
+
+impl<M> Merge for M
+    where M: AssocMerge
+{
+    type Key = M::Key;
+    type Delta = M;
+
+    fn name(&self) -> &CStr { M::name(self) }
+
+    fn fullmerge(key: &Self::Key, current: Option<&Self>, value: &Self::Delta) -> result::Result<Self, ()> {
+        M::merge(key, current, value)
+    }
+
+    fn partialmerge(key: &Self::Key, left: &Self::Delta, right: &Self::Delta) -> Option<Self::Delta> {
+        match M::merge(key, Some(left), right) {
+            Err(_) => None,
+            Ok(v) => Some(v)
+        }
+    }
 }
 
 #[allow(raw_pointer_derive)]
