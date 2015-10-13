@@ -1,6 +1,8 @@
 RocksDB
 =======
 
+[![Build Status](https://travis-ci.org/jsgf/myrocksdb.svg?branch=master)](https://travis-ci.org/jsgf/myrocksdb)
+
 This is a high-level binding to RocksDB. The intent is to provide a
 safe, efficient, complete and ergonomic binding to RocksDB's API. It
 is based on RocksDB's C binding, but aims to present an interface at
